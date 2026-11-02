@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1-csharp.1 (fork)
+
+- Rename previews retain exclusive end ranges, escaped replacement text, document versions, resource operations and the original raw `WorkspaceEdit`. Truncated plans link to complete temporary JSON. Preview remains non-mutating and is not a checked apply operation.
+- Diagnostics support explicit `mode="pull"` for fresh file/workspace reports and optional severity filtering. Cached results are labelled as potentially stale/incomplete; unsupported or incomplete pulls are errors, not a clean result.
+- Definitions support opt-in `includeMetadata` to read csharp-ls virtual metadata documents; long results link to complete temporary text.
+- File sync detects changed content on repeated reads and sends `didOpen` to a replacement client instead of a stray `didChange` after restart.
+- Workspace-folder changes replace clients; identical folders reuse them. Shutdown includes starting clients and cancels pending crash-restart timers. Direct subprocess termination awaits exit with bounded escalation.
+- Notifications handle their own rejected writes. The extension no longer installs a process-wide uncaught-exception suppressor.
+- Added cross-platform subprocess regression tests and corrected platform-dependent expected path separators in one existing test.
+
 ## 1.4.0
 
 1.3.0 is the latest release on npm. This release also ships the fix for #13, which was merged on GitHub after 1.3.0 but never released.

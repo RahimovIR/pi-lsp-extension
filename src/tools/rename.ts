@@ -12,45 +12,38 @@ import type { LspManager } from "../lsp-manager.js";
 import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
 import { resolveSymbolPosition, getSymbolNames } from "../shared/resolve-position.js";
 import { fileURLToPath } from "node:url";
-import { relative } from "node:path";
+import { relative, join } from "node:path";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
-function formatWorkspaceEdit(edit: WorkspaceEdit, rootDir: string): { summary: string; fileCount: number; editCount: number } {
+export function formatWorkspaceEdit(edit: WorkspaceEdit, rootDir: string): { summary: string; fileCount: number; editCount: number; resourceOperations: number } {
   const lines: string[] = [];
-  let totalEdits = 0;
-  let fileCount = 0;
-
+  const files = new Set<string>();
+  let editCount = 0;
+  let resourceOperations = 0;
+  const appendEdits = (uri: string, edits: TextEdit[], version?: number | null) => {
+    files.add(uri);
+    let file: string;
+    try { file = relative(rootDir, fileURLToPath(uri)); } catch { file = uri; }
+    lines.push(`${file}${version !== undefined ? ` (document version: ${version ?? "unspecified"})` : ""}:`);
+    for (const textEdit of edits) {
+      const { start, end } = textEdit.range;
+      lines.push(`  ${start.line + 1}:${start.character + 1}-${end.line + 1}:${end.character + 1} → ${JSON.stringify(textEdit.newText)}`);
+      editCount++;
+    }
+  };
   if (edit.documentChanges) {
     for (const change of edit.documentChanges) {
-      if ("textDocument" in change && "edits" in change) {
-        fileCount++;
-        let relPath: string;
-        try { relPath = relative(rootDir, fileURLToPath(change.textDocument.uri)); } catch { relPath = change.textDocument.uri; }
-        lines.push(`${relPath}:`);
-        for (const textEdit of change.edits as TextEdit[]) {
-          const line = textEdit.range.start.line + 1;
-          const col = textEdit.range.start.character + 1;
-          lines.push(`  ${line}:${col} → "${textEdit.newText}"`);
-          totalEdits++;
-        }
+      if ("textDocument" in change) {
+        appendEdits(change.textDocument.uri, change.edits as TextEdit[], change.textDocument.version);
+      } else {
+        resourceOperations++;
+        lines.push(`Resource operation: ${JSON.stringify(change)}`);
       }
     }
   }
-
-  const changes = edit.changes ?? {};
-  for (const [uri, edits] of Object.entries(changes)) {
-    fileCount++;
-    let relPath: string;
-    try { relPath = relative(rootDir, fileURLToPath(uri)); } catch { relPath = uri; }
-    lines.push(`${relPath}:`);
-    for (const textEdit of edits) {
-      const line = textEdit.range.start.line + 1;
-      const col = textEdit.range.start.character + 1;
-      lines.push(`  ${line}:${col} → "${textEdit.newText}"`);
-      totalEdits++;
-    }
-  }
-
-  return { summary: lines.join("\n"), fileCount, editCount: totalEdits };
+  for (const [uri, edits] of Object.entries(edit.changes ?? {})) appendEdits(uri, edits);
+  return { summary: lines.join("\n"), fileCount: files.size, editCount, resourceOperations };
 }
 
 const RenameParams = Type.Object({
@@ -61,7 +54,13 @@ const RenameParams = Type.Object({
   newName: Type.String({ description: "New name for the symbol" }),
 });
 
-interface RenameDetails { fileCount: number; editCount: number }
+interface RenameDetails {
+  fileCount: number;
+  editCount: number;
+  workspaceEdit?: WorkspaceEdit;
+  resourceOperations?: number;
+  fullOutputPath?: string;
+}
 
 export function createRenameTool(
   manager: LspManager,
@@ -117,9 +116,9 @@ export function createRenameTool(
         }
 
         const rootDir = manager.resolvePath(".");
-        const { summary, fileCount, editCount } = formatWorkspaceEdit(result, rootDir);
+        const { summary, fileCount, editCount, resourceOperations } = formatWorkspaceEdit(result, rootDir);
 
-        if (editCount === 0) {
+        if (editCount === 0 && resourceOperations === 0) {
           const text = resolvedFrom ? `${resolvedFrom}\n\nNo edits needed for this rename.` : "No edits needed for this rename.";
           return { content: [{ type: "text", text }], details: { fileCount: 0, editCount: 0 } };
         }
@@ -127,14 +126,20 @@ export function createRenameTool(
         const truncation = truncateHead(summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
         let text = "";
         if (resolvedFrom) text += `${resolvedFrom}\n\n`;
-        text += `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s)\n\n`;
-        text += "NOTE: These changes are NOT applied. Use edit/write tools to make the changes.\n\n";
+        text += `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s), ${resourceOperations} resource operation(s)\n\n`;
+        text += "NOTE: Preview only. Ranges are 1-based UTF-16, with an exclusive end. Recompute if documents change; this is not a version-checked apply operation.\n\n";
         text += truncation.content;
-        if (truncation.truncated) text += `\n\n[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines]`;
+        let fullOutputPath: string | undefined;
+        if (truncation.truncated) {
+          const dir = await mkdtemp(join(tmpdir(), "pi-lsp-rename-"));
+          fullOutputPath = join(dir, "workspace-edit.json");
+          await writeFile(fullOutputPath, JSON.stringify(result, null, 2), "utf8");
+          text += `\n\n[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines. Full raw WorkspaceEdit (0-based LSP ranges): ${fullOutputPath}]`;
+        }
 
-        return { content: [{ type: "text", text }], details: { fileCount, editCount } };
+        return { content: [{ type: "text", text }], details: { fileCount, editCount, resourceOperations, workspaceEdit: result, fullOutputPath } };
       } catch (err: any) {
-        return { content: [{ type: "text", text: `LSP rename request failed: ${err.message}` }], details: { fileCount: 0, editCount: 0 } };
+        return { isError: true, content: [{ type: "text", text: `LSP rename request failed: ${err.message}` }], details: { fileCount: 0, editCount: 0 } };
       }
     },
 
@@ -153,8 +158,8 @@ export function createRenameTool(
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Computing..."), 0, 0);
       const details = result.details;
-      if (!details || details.editCount === 0) return new Text(theme.fg("dim", "No edits"), 0, 0);
-      return new Text(theme.fg("success", `${details.editCount} edit(s) in ${details.fileCount} file(s) (preview only)`), 0, 0);
+      if (!details || (details.editCount === 0 && !details.resourceOperations)) return new Text(theme.fg("dim", "No edits"), 0, 0);
+      return new Text(theme.fg("success", `${details.editCount} edit(s) in ${details.fileCount} file(s), ${details.resourceOperations ?? 0} resource operation(s) (preview only)`), 0, 0);
     },
   };
 }

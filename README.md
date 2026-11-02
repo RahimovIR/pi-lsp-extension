@@ -2,6 +2,31 @@
 
 A [pi](https://github.com/earendil-works/pi) coding agent extension that integrates Language Server Protocol (LSP) servers, giving the LLM access to the same language intelligence that powers your IDE.
 
+## C# fork
+
+This fork is based on upstream [v1.4.0](https://github.com/samfoy/pi-lsp-extension/tree/v1.4.0). It adds lossless rename previews, explicit fresh diagnostic pulls, and opt-in csharp-ls metadata reading. It also fixes file synchronization after server restarts/worktree changes and cleanup during startup/shutdown. No refactoring is automatically applied.
+
+- `lsp_rename` displays **start–exclusive end** ranges (1-based UTF-16), JSON-escaped replacement text and document versions. The original 0-based `WorkspaceEdit` is preserved in result `details.workspaceEdit`; a truncated preview links to a complete temporary JSON file. Recompute plans after edits; this is **not** a version-checked apply operation.
+- `lsp_diagnostics({path: "*", mode: "pull", severity: "error"})` requests fresh reports from running servers and filters output, while retaining the unfiltered total count. The default `mode: "cached"` remains the asynchronous push cache, explicitly labelled incomplete/stale. Unsupported or incomplete pulls fail rather than reporting a clean workspace.
+- `lsp_definition({path: "Example.cs", line: 10, character: 20, includeMetadata: true})` reads returned `csharp:` definitions through the same server's `csharp/metadata` endpoint. Native filesystem `read` cannot read these virtual URIs. Long metadata output links to the complete temporary text.
+
+For csharp-ls, configure an explicit solution and enable metadata URIs:
+
+```json
+{
+  "servers": {
+    "csharp": {
+      "command": "csharp-ls",
+      "args": ["--solution", "Example.sln", "--features", "metadata-uris"]
+    }
+  }
+}
+```
+
+Use the correct .NET SDK/MSBuild, restored NuGet assets and framework reference assemblies. Legacy .NET Framework/WPF solutions may also need referenced libraries built locally for XAML design-time loading. For an x64 Release solution, set the server's `env` to `{"Platform": "x64", "Configuration": "Release"}`. This does not start the host CAD application or deploy its plugins.
+
+Changing registered workspace folders restarts clients; registering the same folders reuses them. Changing `/lsp-config` arguments alone still requires `/lsp-restart csharp`. Direct-process lifecycle is tested; shared daemon handoff and concurrent synthetic-dot edits are not covered by these C# tests.
+
 ## Tools
 
 | Tool | Description |
@@ -31,15 +56,16 @@ After a successful `write` or `edit`, if an LSP server is already running for th
 ## Installation
 
 ```bash
-pi install npm:pi-lsp-extension
-# or straight from GitHub
-pi install git:github.com/samfoy/pi-lsp-extension
+# This fork (pin an exact commit instead of the branch for reproducibility):
+pi install git:github.com/RahimovIR/pi-lsp-extension@fix/csharp-agent-tools
+# One-invocation trial without changing settings:
+pi -e git:github.com/RahimovIR/pi-lsp-extension@fix/csharp-agent-tools
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/samfoy/pi-lsp-extension.git
+git clone --branch fix/csharp-agent-tools https://github.com/RahimovIR/pi-lsp-extension.git
 cd pi-lsp-extension
 npm install
 npm run build        # bundles src/ into dist/ (committed, so git installs need no build)
@@ -83,7 +109,7 @@ Add more at runtime:
 1. **Lazy startup** — servers start on first tool use for a file type (or eagerly via [`.pi-lsp.json`](#project-config))
 2. **Tree-sitter fallback** — when no LSP server is running, tools like `lsp_diagnostics`, `lsp_hover`, `lsp_definition`, and `lsp_symbols` fall back to tree-sitter for syntax errors, signatures, and symbol extraction
 3. **File sync** — pi's `read`/`write`/`edit` operations are automatically synced to the LSP via `didOpen`/`didChange`, with LRU eviction (`didClose`) after 100 tracked files
-4. **Diagnostics cache** — the server pushes diagnostics asynchronously; tools read from a local cache
+4. **Diagnostics** — default tools read the asynchronous push cache; `lsp_diagnostics` with `mode="pull"` explicitly requests a fresh file/workspace report
 5. **Auto-diagnostics** — errors are appended to write/edit results when a server is running
 6. **Shared daemons** — in supported workspaces, LSP servers run as background daemons shared across pi sessions
 
@@ -209,7 +235,8 @@ src/
 ## Tips
 
 - Position parameters are 1-indexed (line 1, column 1 = first character)
-- `lsp_rename` returns a preview — the LLM uses `edit`/`write` to apply changes
+- `lsp_rename` returns a preview with complete ranges — inspect/recompute it before using `edit`/`write`; never blindly apply a stale plan
+- Do not load this fork and the upstream package simultaneously: both register the same tool names
 - Use `/lsp-restart java` after changing Lombok config — jdtls needs a full restart to pick up `-javaagent` changes
 - Set `PI_LSP_DEBUG=1` to enable debug logging for troubleshooting
 - The extension adds a system prompt guideline nudging the LLM to check diagnostics after edits

@@ -94,6 +94,31 @@ export class LspClient {
     return new Map(this._diagnostics);
   }
 
+  /** Request fresh diagnostics without presenting the asynchronous push cache as complete. */
+  async pullDiagnostics(uri?: string): Promise<Map<string, Diagnostic[]>> {
+    const provider = this.serverCapabilities?.diagnosticProvider;
+    if (!provider || (!uri && !("workspaceDiagnostics" in provider && provider.workspaceDiagnostics))) {
+      throw new Error(`LSP ${this.languageId} does not advertise ${uri ? "document" : "workspace"} pull diagnostics; use mode="cached" for the push cache.`);
+    }
+    const result = await this.sendRequest<any>(uri ? "textDocument/diagnostic" : "workspace/diagnostic",
+      uri ? { textDocument: { uri } } : { previousResultIds: [] });
+    const diagnostics = new Map<string, Diagnostic[]>();
+    const add = (documentUri: string, report: any) => {
+      if (!report || report.kind !== "full" || !Array.isArray(report.items)) {
+        throw new Error(`LSP ${this.languageId} returned an incomplete diagnostic report for ${documentUri}`);
+      }
+      diagnostics.set(documentUri, report.items);
+    };
+    if (uri) {
+      add(uri, result);
+      for (const [relatedUri, report] of Object.entries(result.relatedDocuments ?? {})) add(relatedUri, report);
+    } else {
+      if (!result || !Array.isArray(result.items)) throw new Error(`LSP ${this.languageId} returned an invalid workspace diagnostic report`);
+      for (const report of result.items) add(report.uri, report);
+    }
+    return diagnostics;
+  }
+
   /** Start the LSP server and perform the initialize handshake */
   async start(): Promise<void> {
     if (this._initialized || this._disposed) return;
@@ -227,6 +252,8 @@ export class LspClient {
       this.process!.on("error", onError);
     });
 
+    if (this._disposed) throw new Error(`LSP ${this.languageId} shut down during startup`);
+
     // Discard stderr to prevent blocking
     this.process.stderr?.resume();
 
@@ -341,10 +368,11 @@ export class LspClient {
       "initialize",
       initParams
     );
+    if (this._disposed) throw new Error(`LSP ${this.languageId} shut down during initialization`);
     this._serverCapabilities = result.capabilities;
 
     // Send initialized notification
-    this.connection.sendNotification("initialized", {});
+    await this.connection.sendNotification("initialized", {});
     this._initialized = true;
   }
 
@@ -371,7 +399,9 @@ export class LspClient {
   /** Send a notification to the LSP server */
   sendNotification(method: string, params: unknown): void {
     if (!this.connection || !this._initialized) return;
-    this.connection.sendNotification(method, params);
+    this.connection.sendNotification(method, params).catch((err) => {
+      if (!this._disposed) console.error(`[LSP ${this.languageId}] Notification ${method} failed: ${err.message}`);
+    });
   }
 
   /** Notify server of a newly opened document */
@@ -419,27 +449,28 @@ export class LspClient {
         // so if the timeout wins, the abandoned sendRequest rejection doesn't
         // become an unhandled promise rejection.
         const shutdownReq = this.connection.sendRequest("shutdown").catch(() => {});
-        await Promise.race([
-          shutdownReq,
-          new Promise((resolve) => setTimeout(resolve, 3000)),
-        ]);
-        try { this.connection.sendNotification("exit"); } catch {}
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([shutdownReq, new Promise(resolve => { timer = setTimeout(resolve, 3000); })]);
+        } finally { clearTimeout(timer); }
+        try { await this.connection.sendNotification("exit"); } catch {}
       }
     } catch {
       // Server may already be dead
     }
     this.disposeConnection();
 
-    if (this.process) {
-      this.process.kill("SIGTERM");
-      // Force kill after 2s
-      setTimeout(() => {
-        if (this.process && !this.process.killed) {
-          this.process.kill("SIGKILL");
-        }
-      }, 2000);
-    }
-
+    const child = this.process;
     this.process = null;
+    this._diagnostics.clear();
+    if (child && child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(forceKill); clearTimeout(deadline); child.removeListener("exit", done); resolve(); };
+        const forceKill = setTimeout(() => child.kill("SIGKILL"), 2000);
+        const deadline = setTimeout(done, 3000);
+        child.once("exit", done);
+        child.kill("SIGTERM");
+      });
+    }
   }
 }

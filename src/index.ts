@@ -100,19 +100,6 @@ function loadProjectConfig(dir: string): ProjectLspConfig | null {
 }
 
 export default function lspExtension(pi: ExtensionAPI) {
-  // Prevent EPIPE errors from LSP server exits from crashing the host process.
-  // When an LSP server exits unexpectedly, in-flight writes to its stdin pipe
-  // can produce EPIPE errors that escape all connection-level error handlers.
-  const origListeners = process.listeners("uncaughtException");
-  process.on("uncaughtException", (err: any) => {
-    if (err?.code === "EPIPE") return; // swallow — LSP server exited, harmless
-    // Re-throw for other handlers
-    for (const listener of origListeners) (listener as any)(err);
-    if (origListeners.length === 0) {
-      console.error("[LSP] Uncaught exception:", err);
-    }
-  });
-
   let manager: LspManager | null = null;
   let fileSync: FileSync | null = null;
   let treeSitter: TreeSitterManager | null = null;

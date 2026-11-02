@@ -1,6 +1,6 @@
 {
   "name": "pi-lsp-extension",
-  "version": "1.4.0",
+  "version": "1.4.1-csharp.1",
   "type": "module",
   "description": "Pi coding agent extension for LSP (Language Server Protocol) integration",
   "keywords": [
@@ -15,11 +15,11 @@
   "author": "Sam Painter",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/samfoy/pi-lsp-extension.git"
+    "url": "git+https://github.com/RahimovIR/pi-lsp-extension.git"
   },
-  "homepage": "https://github.com/samfoy/pi-lsp-extension#readme",
+  "homepage": "https://github.com/RahimovIR/pi-lsp-extension#readme",
   "bugs": {
-    "url": "https://github.com/samfoy/pi-lsp-extension/issues"
+    "url": "https://github.com/RahimovIR/pi-lsp-extension/issues"
   },
   "engines": {
     "node": ">=22.19.0"

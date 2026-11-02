@@ -62,6 +62,32 @@ var LspClient = class {
   getAllDiagnostics() {
     return new Map(this._diagnostics);
   }
+  /** Request fresh diagnostics without presenting the asynchronous push cache as complete. */
+  async pullDiagnostics(uri) {
+    const provider = this.serverCapabilities?.diagnosticProvider;
+    if (!provider || !uri && !("workspaceDiagnostics" in provider && provider.workspaceDiagnostics)) {
+      throw new Error(`LSP ${this.languageId} does not advertise ${uri ? "document" : "workspace"} pull diagnostics; use mode="cached" for the push cache.`);
+    }
+    const result = await this.sendRequest(
+      uri ? "textDocument/diagnostic" : "workspace/diagnostic",
+      uri ? { textDocument: { uri } } : { previousResultIds: [] }
+    );
+    const diagnostics = /* @__PURE__ */ new Map();
+    const add = (documentUri, report) => {
+      if (!report || report.kind !== "full" || !Array.isArray(report.items)) {
+        throw new Error(`LSP ${this.languageId} returned an incomplete diagnostic report for ${documentUri}`);
+      }
+      diagnostics.set(documentUri, report.items);
+    };
+    if (uri) {
+      add(uri, result);
+      for (const [relatedUri, report] of Object.entries(result.relatedDocuments ?? {})) add(relatedUri, report);
+    } else {
+      if (!result || !Array.isArray(result.items)) throw new Error(`LSP ${this.languageId} returned an invalid workspace diagnostic report`);
+      for (const report of result.items) add(report.uri, report);
+    }
+    return diagnostics;
+  }
   /** Start the LSP server and perform the initialize handshake */
   async start() {
     if (this._initialized || this._disposed) return;
@@ -172,6 +198,7 @@ var LspClient = class {
       this.process.on("spawn", onSpawn);
       this.process.on("error", onError);
     });
+    if (this._disposed) throw new Error(`LSP ${this.languageId} shut down during startup`);
     this.process.stderr?.resume();
     const stdin = this.process.stdin;
     const originalWrite = stdin.write;
@@ -259,8 +286,9 @@ var LspClient = class {
       "initialize",
       initParams
     );
+    if (this._disposed) throw new Error(`LSP ${this.languageId} shut down during initialization`);
     this._serverCapabilities = result.capabilities;
-    this.connection.sendNotification("initialized", {});
+    await this.connection.sendNotification("initialized", {});
     this._initialized = true;
   }
   /** Safely dispose the connection without throwing */
@@ -283,7 +311,9 @@ var LspClient = class {
   /** Send a notification to the LSP server */
   sendNotification(method, params) {
     if (!this.connection || !this._initialized) return;
-    this.connection.sendNotification(method, params);
+    this.connection.sendNotification(method, params).catch((err) => {
+      if (!this._disposed) console.error(`[LSP ${this.languageId}] Notification ${method} failed: ${err.message}`);
+    });
   }
   /** Notify server of a newly opened document */
   didOpen(uri, languageId, version, text) {
@@ -321,27 +351,39 @@ var LspClient = class {
       if (this.connection) {
         const shutdownReq = this.connection.sendRequest("shutdown").catch(() => {
         });
-        await Promise.race([
-          shutdownReq,
-          new Promise((resolve6) => setTimeout(resolve6, 3e3))
-        ]);
+        let timer;
         try {
-          this.connection.sendNotification("exit");
+          await Promise.race([shutdownReq, new Promise((resolve6) => {
+            timer = setTimeout(resolve6, 3e3);
+          })]);
+        } finally {
+          clearTimeout(timer);
+        }
+        try {
+          await this.connection.sendNotification("exit");
         } catch {
         }
       }
     } catch {
     }
     this.disposeConnection();
-    if (this.process) {
-      this.process.kill("SIGTERM");
-      setTimeout(() => {
-        if (this.process && !this.process.killed) {
-          this.process.kill("SIGKILL");
-        }
-      }, 2e3);
-    }
+    const child = this.process;
     this.process = null;
+    this._diagnostics.clear();
+    if (child && child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve6) => {
+        const done = () => {
+          clearTimeout(forceKill);
+          clearTimeout(deadline);
+          child.removeListener("exit", done);
+          resolve6();
+        };
+        const forceKill = setTimeout(() => child.kill("SIGKILL"), 2e3);
+        const deadline = setTimeout(done, 3e3);
+        child.once("exit", done);
+        child.kill("SIGTERM");
+      });
+    }
   }
 };
 
@@ -454,6 +496,11 @@ var LspManager = class _LspManager {
   _sessionId;
   _lombokJarPath = null;
   _shuttingDown = false;
+  _disposed = false;
+  _workspaceKey;
+  _workspaceSwitch = Promise.resolve();
+  _startingClients = /* @__PURE__ */ new Set();
+  _restartTimers = /* @__PURE__ */ new Set();
   _restartAttempts = /* @__PURE__ */ new Map();
   _restartBackoff = /* @__PURE__ */ new Map();
   static MAX_RESTART_ATTEMPTS = 3;
@@ -466,6 +513,7 @@ var LspManager = class _LspManager {
       ...customConfigs
     }));
     this._workspace = workspace ?? new DefaultWorkspaceProvider();
+    this._workspaceKey = this.workspaceKey(this._workspace);
     this._callbacks = callbacks ?? {};
     this._sessionId = sessionId ?? `${process.pid}-${Date.now()}`;
   }
@@ -475,9 +523,25 @@ var LspManager = class _LspManager {
   }
   /** Replace the workspace provider (e.g. when an external extension registers one) */
   setWorkspaceProvider(provider) {
-    this._workspace = provider;
-    this._workspaceReady = false;
-    this._workspaceReadying = null;
+    const key = this.workspaceKey(provider);
+    if (key === this._workspaceKey) {
+      this._workspace = provider;
+      return;
+    }
+    this._workspaceKey = key;
+    this._shuttingDown = true;
+    this._workspaceSwitch = this._workspaceSwitch.then(async () => {
+      if (this._disposed) return;
+      this._workspace.shutdown();
+      await this.stopClients();
+      this._workspace = provider;
+      this._workspaceReady = false;
+      this._workspaceReadying = null;
+      if (!this._disposed) this._shuttingDown = false;
+    });
+  }
+  workspaceKey(provider) {
+    return JSON.stringify([provider.workspaceRoot, provider.stateDir, provider.getWorkspaceFolders()]);
   }
   /** Update or add a server configuration */
   setServerConfig(languageId, config) {
@@ -668,6 +732,7 @@ var LspManager = class _LspManager {
    * Does not start a new server. Returns null if no client is active.
    */
   getRunningClient(languageId) {
+    if (this._disposed || this._shuttingDown) return null;
     const existing = this.clients.get(languageId);
     if (existing && existing.initialized && !existing.disposed) {
       return existing;
@@ -725,6 +790,8 @@ var LspManager = class _LspManager {
    * Returns null if no server is configured for this language.
    */
   async getClientForLanguage(languageId) {
+    await this._workspaceSwitch;
+    if (this._disposed || this._shuttingDown) return null;
     const existing = this.clients.get(languageId);
     if (existing && existing.initialized && !existing.disposed) {
       return existing;
@@ -755,15 +822,7 @@ var LspManager = class _LspManager {
    */
   startEagerly(languageIds) {
     for (const languageId of languageIds) {
-      const existing = this.clients.get(languageId);
-      if (existing && existing.initialized && !existing.disposed) continue;
-      if (this.startingServers.has(languageId)) continue;
-      const config = this.serverConfigs.get(languageId);
-      if (!config) continue;
-      const startPromise = this.startServer(languageId, config);
-      this.startingServers.set(languageId, startPromise);
-      startPromise.catch((err) => {
-        this.startingServers.delete(languageId);
+      this.getClientForLanguage(languageId).catch((err) => {
         this._callbacks.onServerError?.(languageId, `Auto-start failed: ${err.message}`);
       });
     }
@@ -791,6 +850,7 @@ var LspManager = class _LspManager {
   }
   async startServer(languageId, config) {
     await this.ensureWorkspace();
+    if (this._disposed || this._shuttingDown) throw new Error("LSP manager is shutting down");
     const stateDir = this._workspace.stateDir;
     const folders = this._workspace.getWorkspaceFolders();
     const workspaceFolders = folders.length > 0 ? folders : void 0;
@@ -817,7 +877,7 @@ var LspManager = class _LspManager {
           settings: config.settings,
           onUnexpectedExit
         });
-        await client2.start();
+        await this.startClient(client2);
         this.clients.set(languageId, client2);
         this.startingServers.delete(languageId);
         this._callbacks.onServerReady?.(languageId);
@@ -853,7 +913,7 @@ var LspManager = class _LspManager {
               settings: config.settings,
               onUnexpectedExit
             });
-            await client2.start();
+            await this.startClient(client2);
             this.clients.set(languageId, client2);
             this.startingServers.delete(languageId);
             this._callbacks.onServerReady?.(languageId);
@@ -887,7 +947,7 @@ var LspManager = class _LspManager {
       onUnexpectedExit
     });
     try {
-      await client.start();
+      await this.startClient(client);
       this.clients.set(languageId, client);
       this.startingServers.delete(languageId);
       this._callbacks.onServerReady?.(languageId);
@@ -900,6 +960,18 @@ var LspManager = class _LspManager {
       const message = `Failed to start LSP server for ${languageId} (${config.command}): ${err.message}`;
       this._callbacks.onServerError?.(languageId, message);
       throw new Error(message);
+    }
+  }
+  async startClient(client) {
+    this._startingClients.add(client);
+    try {
+      await client.start();
+      if (this._disposed || this._shuttingDown) throw new Error("LSP manager shut down during startup");
+    } catch (error) {
+      await client.shutdown();
+      throw error;
+    } finally {
+      this._startingClients.delete(client);
     }
   }
   /**
@@ -981,7 +1053,7 @@ var LspManager = class _LspManager {
       statuses.push({
         languageId,
         command: config.command,
-        running: client?.initialized === true && !client.disposed,
+        running: !this._disposed && !this._shuttingDown && client?.initialized === true && !client.disposed,
         diagnosticsCount,
         shared: daemonAlive
       });
@@ -1006,8 +1078,9 @@ var LspManager = class _LspManager {
     this._restartAttempts.set(languageId, attempts + 1);
     this._restartBackoff.set(languageId, Math.min(backoff * 2, _LspManager.MAX_BACKOFF_MS));
     this._callbacks.onServerCrash?.(languageId, true, attempts + 1);
-    setTimeout(() => {
-      if (this._shuttingDown) return;
+    const timer = setTimeout(() => {
+      this._restartTimers.delete(timer);
+      if (this._shuttingDown || this._disposed) return;
       const config = this.serverConfigs.get(languageId);
       if (!config) return;
       const startPromise = this.startServer(languageId, config);
@@ -1018,18 +1091,28 @@ var LspManager = class _LspManager {
         this.handleUnexpectedExit(languageId, null);
       });
     }, backoff);
+    this._restartTimers.add(timer);
   }
   /** Shut down all clients (disconnect from daemons, kill direct servers) */
   async shutdownAll() {
-    this._workspace.shutdown();
+    this._disposed = true;
     this._shuttingDown = true;
-    const shutdowns = [...this.clients.values()].map(
-      (client) => client.shutdown().catch(() => {
-      })
-    );
-    await Promise.all(shutdowns);
+    await this._workspaceSwitch;
+    this._workspace.shutdown();
+    await this.stopClients();
+  }
+  async stopClients() {
+    this._shuttingDown = true;
+    for (const timer of this._restartTimers) clearTimeout(timer);
+    this._restartTimers.clear();
+    const pending = [...this.startingServers.values()];
+    const clients = /* @__PURE__ */ new Set([...this.clients.values(), ...this._startingClients]);
+    await Promise.allSettled([...clients].map((client) => client.shutdown()));
+    await Promise.allSettled(pending);
     this.clients.clear();
     this.startingServers.clear();
+    this._restartAttempts.clear();
+    this._restartBackoff.clear();
   }
   /**
    * Restart a specific language server. Shuts down the existing client
@@ -1037,6 +1120,8 @@ var LspManager = class _LspManager {
    * Returns once the new server is initialized, or throws on failure.
    */
   async restartServer(languageId) {
+    await this._workspaceSwitch;
+    if (this._disposed) throw new Error("LSP manager is shut down");
     const existing = this.clients.get(languageId);
     if (existing) {
       await existing.shutdown().catch(() => {
@@ -1117,10 +1202,7 @@ var FileSync = class {
       if (oldest.done) break;
       const [evictUri, evictDoc] = oldest.value;
       this.tracked.delete(evictUri);
-      const client = this.manager.getRunningClient(evictDoc.languageId);
-      if (client) {
-        client.didClose(evictUri);
-      }
+      evictDoc.client.didClose(evictUri);
     }
   }
   /**
@@ -1128,24 +1210,7 @@ var FileSync = class {
    * Called from tool_result handler for the `read` tool.
    */
   async handleFileRead(filePath) {
-    const absPath = this.manager.resolvePath(filePath);
-    const uri = this.manager.getFileUri(absPath);
-    if (this.tracked.has(uri)) {
-      this.touchAndEvict(uri);
-      return;
-    }
-    const languageId = this.manager.getLanguageId(absPath);
-    if (!languageId) return;
-    const client = this.manager.getRunningClient(languageId);
-    if (!client) return;
-    try {
-      const content = await readFile(absPath, "utf-8");
-      const doc = { uri, languageId, version: 1 };
-      this.tracked.set(uri, doc);
-      client.didOpen(uri, languageId, doc.version, content);
-      this.touchAndEvict(uri);
-    } catch {
-    }
+    await this.syncFile(filePath, false);
   }
   /**
    * Handle a file being written/edited — sends didOpen or didChange.
@@ -1154,7 +1219,6 @@ var FileSync = class {
   async handleFileWrite(filePath) {
     const absPath = this.manager.resolvePath(filePath);
     const uri = this.manager.getFileUri(absPath);
-    const languageId = this.manager.getLanguageId(absPath);
     if (this.treeSitter) {
       this.treeSitter.invalidate(absPath);
       if (this.workspaceIndex) {
@@ -1162,7 +1226,6 @@ var FileSync = class {
         });
       }
     }
-    if (!languageId) return;
     if (this.isSyntheticDotActive(uri)) {
       setTimeout(() => {
         if (!this.isSyntheticDotActive(uri)) {
@@ -1172,16 +1235,26 @@ var FileSync = class {
       }, 200);
       return;
     }
-    const client = await this.manager.getClientForFile(absPath).catch(() => null);
+    await this.syncFile(filePath, true);
+  }
+  async syncFile(filePath, startClient) {
+    const absPath = this.manager.resolvePath(filePath);
+    const uri = this.manager.getFileUri(absPath);
+    const languageId = this.manager.getLanguageId(absPath);
+    if (!languageId) return;
+    const client = startClient ? await this.manager.getClientForFile(absPath).catch(() => null) : this.manager.getRunningClient(languageId);
     if (!client) return;
     try {
-      const content = await readFile(absPath, "utf-8");
+      const content = await readFile(absPath, "utf8");
       const existing = this.tracked.get(uri);
-      if (existing) {
-        existing.version++;
-        client.didChange(uri, existing.version, content);
+      if (existing?.client === client) {
+        if (existing.content !== content) {
+          existing.version++;
+          existing.content = content;
+          client.didChange(uri, existing.version, content);
+        }
       } else {
-        const doc = { uri, languageId, version: 1 };
+        const doc = { uri, languageId, version: 1, client, content };
         this.tracked.set(uri, doc);
         client.didOpen(uri, languageId, doc.version, content);
       }
@@ -1196,7 +1269,7 @@ var FileSync = class {
    */
   getTrackedVersion(uri) {
     const doc = this.tracked.get(uri);
-    return doc ? doc.version : null;
+    return doc && this.manager.getRunningClient(doc.languageId) === doc.client ? doc.version : null;
   }
   /**
    * Update the tracked version for a URI after external didChange calls.
@@ -1934,221 +2007,94 @@ function resolveProvider(filePath, manager, treeSitter) {
 import { readFile as readFile3 } from "node:fs/promises";
 import { relative } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
-function severityToString(severity) {
-  switch (severity) {
-    case DiagnosticSeverity.Error:
-      return "error";
-    case DiagnosticSeverity.Warning:
-      return "warning";
-    case DiagnosticSeverity.Information:
-      return "info";
-    case DiagnosticSeverity.Hint:
-      return "hint";
-    default:
-      return "unknown";
-  }
-}
-function formatDiagnostic(diag, filePath) {
-  const line = diag.range.start.line + 1;
-  const col = diag.range.start.character + 1;
-  const sev = severityToString(diag.severity);
-  const source = diag.source ? ` [${diag.source}]` : "";
-  const code = diag.code !== void 0 ? ` (${diag.code})` : "";
-  return `${filePath}:${line}:${col} ${sev}: ${diag.message}${code}${source}`;
-}
 var DiagnosticsParams = Type.Object({
-  path: Type.String({ description: 'File path to get diagnostics for. Pass "*" to get all workspace diagnostics from all running LSP servers.' })
+  path: Type.String({ description: "File path, or '*' for all running language servers. Workspace mode does not start servers." }),
+  mode: Type.Optional(Type.Union([Type.Literal("cached"), Type.Literal("pull")], { description: "cached (default): fast asynchronous push cache, not a complete fresh check. pull: request fresh diagnostics; fails explicitly when unsupported." })),
+  severity: Type.Optional(Type.Union([Type.Literal("error"), Type.Literal("warning"), Type.Literal("information"), Type.Literal("hint")], { description: "Maximum severity number to include: warning includes errors and warnings. Default includes all diagnostics." }))
 });
+var severityNames = ["unknown", "error", "warning", "info", "hint"];
+function formatDiagnostic(diag, file) {
+  return `${file}:${diag.range.start.line + 1}:${diag.range.start.character + 1} ${severityNames[diag.severity ?? 0] ?? "unknown"}: ${diag.message}${diag.code !== void 0 ? ` (${diag.code})` : ""}${diag.source ? ` [${diag.source}]` : ""}`;
+}
 function createDiagnosticsTool(manager, treeSitter) {
   return {
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
-    description: 'Get compilation errors and warnings from the LSP server. Pass a file path to check a single file, or pass "*" to get all cached diagnostics across the workspace.',
-    promptSnippet: 'Get compiler errors, warnings, and hints for a source file via LSP. Pass path="*" to get all workspace diagnostics.',
+    description: "Read cached push diagnostics (default), or request fresh diagnostics with mode='pull'. path='*' queries running servers only. Cached results are not a full solution check. Pull fails explicitly if a server does not support it. Optional severity filters output without hiding total counts.",
+    promptSnippet: "Check cached or fresh compiler diagnostics; use mode='pull' for an explicit current check",
     promptGuidelines: [
-      "After making code changes with edit or write, use lsp_diagnostics to check for compilation errors before moving on.",
-      'To review all workspace diagnostics at once, call lsp_diagnostics with path="*" \u2014 this returns all cached diagnostics from running LSP servers without needing to check files individually.'
+      "Cached diagnostics are asynchronous and may be incomplete or stale. Do not interpret an empty cache as a successful solution build.",
+      "Use mode='pull' for fresh file diagnostics or path='*' for fresh workspace diagnostics from running servers; severity='error' keeps large reports compact."
     ],
     parameters: DiagnosticsParams,
-    async execute(_toolCallId, params) {
+    async execute(_id, params) {
       const filePath = params.path.replace(/^@/, "");
-      if (filePath === "*" || filePath === "") {
-        return executeWorkspaceDiagnostics(manager);
-      }
-      const client = await manager.getClientForFile(filePath).catch(() => null);
-      if (client) {
-        const uri = manager.getFileUri(filePath);
-        const diagnostics = client.getDiagnostics(uri);
-        if (diagnostics.length === 0) {
-          return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
-        }
-        const sorted = [...diagnostics].sort((a, b) => (a.severity ?? 99) - (b.severity ?? 99));
-        const relPath = relative(manager.resolvePath("."), manager.resolvePath(filePath));
-        const lines = sorted.map((d) => formatDiagnostic(d, relPath));
-        const output = lines.join("\n");
-        const errors = sorted.filter((d) => d.severity === DiagnosticSeverity.Error).length;
-        const warnings = sorted.filter((d) => d.severity === DiagnosticSeverity.Warning).length;
-        const other = sorted.length - errors - warnings;
-        const summary = [
-          errors > 0 ? `${errors} error(s)` : null,
-          warnings > 0 ? `${warnings} warning(s)` : null,
-          other > 0 ? `${other} other` : null
-        ].filter(Boolean).join(", ");
-        const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-        let resultText = `${summary}
-
-${truncation.content}`;
-        if (truncation.truncated) {
-          resultText += `
-
-[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
-        }
-        return {
-          content: [{ type: "text", text: resultText }],
-          details: { count: sorted.length, errors, warnings }
-        };
-      }
-      if (treeSitter) {
-        const provider = resolveProvider(filePath, manager, treeSitter);
-        if (provider.type === "tree-sitter") {
-          try {
+      const mode = params.mode ?? "cached";
+      const workspace = filePath === "*" || filePath === "";
+      try {
+        const clients = workspace ? manager.getStatus().filter((s) => s.running).map((s) => manager.getRunningClient(s.languageId)).filter((c) => c !== null) : [await manager.getClientForFile(filePath)].filter((c) => c !== null);
+        if (!clients.length) {
+          if (!workspace && mode === "cached" && treeSitter && resolveProvider(filePath, manager, treeSitter).type === "tree-sitter") {
             const absPath = manager.resolvePath(filePath);
-            const content = await readFile3(absPath, "utf-8");
-            const tree = await treeSitter.parse(absPath, content);
+            const tree = await treeSitter.parse(absPath, await readFile3(absPath, "utf8"));
             if (tree) {
-              const syntaxErrors = getSyntaxErrors(tree);
-              if (syntaxErrors.length === 0) {
-                return { content: [{ type: "text", text: "No syntax errors detected. [tree-sitter \u2014 syntax only, no type checking]" }], details: { count: 0 } };
-              }
-              const relPath = relative(manager.resolvePath("."), absPath);
-              const lines = syntaxErrors.map(
-                (e) => `${relPath}:${e.line + 1}:${e.character + 1} error: ${e.message}`
-              );
-              const output = lines.join("\n");
-              const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-              let resultText = `${syntaxErrors.length} syntax error(s) [tree-sitter \u2014 syntax only, no type checking]
-
-${truncation.content}`;
-              if (truncation.truncated) {
-                resultText += `
-
-[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
-              }
-              return {
-                content: [{ type: "text", text: resultText }],
-                details: { count: syntaxErrors.length, errors: syntaxErrors.length }
-              };
+              const errors2 = getSyntaxErrors(tree);
+              const file = relative(manager.resolvePath("."), absPath);
+              const output2 = errors2.map((e) => `${file}:${e.line + 1}:${e.character + 1} error: ${e.message}`).join("\n");
+              const truncated2 = truncateHead(output2, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+              return { content: [{ type: "text", text: `${errors2.length} syntax error(s) [tree-sitter \u2014 syntax only, no type checking]
+${truncated2.content}${truncated2.truncated ? "\n[Output truncated]" : ""}` }], details: { count: errors2.length, errors: errors2.length, mode, complete: false } };
             }
-          } catch {
+          }
+          return { isError: mode === "pull", content: [{ type: "text", text: workspace ? "No LSP servers are running. Use a source file path to start one; retry once it is ready." : manager.getUnavailableReason(filePath) }], details: { count: 0, mode, complete: false, failed: mode === "pull" } };
+        }
+        const all = [];
+        const root = manager.resolvePath(".");
+        for (const client of clients) {
+          const uri = workspace ? void 0 : manager.getFileUri(filePath);
+          const reports = mode === "pull" ? await client.pullDiagnostics(uri) : uri ? /* @__PURE__ */ new Map([[uri, client.getDiagnostics(uri)]]) : client.getAllDiagnostics();
+          for (const [documentUri, diagnostics] of reports) {
+            let file;
+            try {
+              file = relative(root, fileURLToPath2(documentUri));
+            } catch {
+              file = documentUri;
+            }
+            for (const diagnostic of diagnostics) all.push({ file, diagnostic });
           }
         }
+        const maxSeverity = params.severity ? { error: 1, warning: 2, information: 3, hint: 4 }[params.severity] : Infinity;
+        const selected = all.filter((d) => (d.diagnostic.severity ?? 99) <= maxSeverity);
+        selected.sort((a, b) => (a.diagnostic.severity ?? 99) - (b.diagnostic.severity ?? 99) || a.file.localeCompare(b.file));
+        const errors = selected.filter((d) => d.diagnostic.severity === DiagnosticSeverity.Error).length;
+        const warnings = selected.filter((d) => d.diagnostic.severity === DiagnosticSeverity.Warning).length;
+        const files = new Set(selected.map((d) => d.file)).size;
+        const output = selected.map((d) => formatDiagnostic(d.diagnostic, d.file)).join("\n");
+        const truncated = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+        const scope = mode === "pull" ? "Fresh pull" : "Cached push (may be incomplete or stale)";
+        let text = `${scope}: ${selected.length} diagnostic(s) in ${files} file(s), ${errors} error(s), ${warnings} warning(s).`;
+        if (params.severity) text += ` ${all.length} total before severity filter.`;
+        if (output) text += `
+
+${truncated.content}`;
+        if (truncated.truncated) text += `
+
+[Output truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines]`;
+        return { content: [{ type: "text", text }], details: { count: selected.length, errors, warnings, files, mode, complete: mode === "pull", totalCount: all.length } };
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: `Diagnostics ${mode} failed: ${error.message}. No complete diagnostic result is available.` }], details: { count: 0, mode, complete: false, failed: true } };
       }
-      return {
-        content: [{ type: "text", text: manager.getUnavailableReason(filePath) }],
-        details: { count: 0 }
-      };
     },
     renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("lsp_diagnostics "));
-      if (args.path && args.path !== "*") {
-        text += theme.fg("accent", args.path);
-      } else {
-        text += theme.fg("dim", "(workspace)");
-      }
-      return new Text(text, 0, 0);
+      return new Text(theme.fg("toolTitle", theme.bold("lsp_diagnostics ")) + theme.fg("accent", `${args.path} (${args.mode ?? "cached"})`), 0, 0);
     },
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Checking..."), 0, 0);
-      const details = result.details;
-      if (!details || details.count === 0) {
-        return new Text(theme.fg("success", "\u2713 No diagnostics"), 0, 0);
-      }
-      let text = "";
-      if (details.errors && details.errors > 0) text += theme.fg("error", `${details.errors} error(s)`);
-      if (details.warnings && details.warnings > 0) {
-        if (text) text += " ";
-        text += theme.fg("warning", `${details.warnings} warning(s)`);
-      }
-      if (details.files && details.files > 0) {
-        text += theme.fg("dim", ` in ${details.files} file(s)`);
-      }
-      if (expanded) {
-        const content = result.content[0];
-        if (content?.type === "text") {
-          const lines = content.text.split("\n").slice(0, 30);
-          for (const line of lines) text += `
-${theme.fg("dim", line)}`;
-        }
-      }
-      return new Text(text, 0, 0);
+      const content = result.content[0];
+      const lines = content?.type === "text" ? content.text.split("\n") : ["No result"];
+      const shown = expanded ? lines.slice(0, 30).join("\n") : lines[0];
+      return new Text(theme.fg(result.details?.failed ? "error" : "dim", shown + (expanded && lines.length > 30 ? "\n... (more diagnostics in tool output)" : "")), 0, 0);
     }
-  };
-}
-function executeWorkspaceDiagnostics(manager) {
-  const statuses = manager.getStatus();
-  const running = statuses.filter((s) => s.running);
-  if (running.length === 0) {
-    return {
-      content: [{ type: "text", text: "No LSP servers are running. Use lsp_diagnostics with a file path to start a server and check that file." }],
-      details: { count: 0 }
-    };
-  }
-  const rootDir = manager.resolvePath(".");
-  const allDiagnostics = [];
-  for (const status of running) {
-    const client = manager.getRunningClient(status.languageId);
-    if (!client) continue;
-    const diagMap = client.getAllDiagnostics();
-    for (const [uri, diagnostics] of diagMap) {
-      if (diagnostics.length === 0) continue;
-      let absPath;
-      try {
-        absPath = fileURLToPath2(uri);
-      } catch {
-        absPath = uri;
-      }
-      const relPath = relative(rootDir, absPath);
-      for (const diag of diagnostics) {
-        allDiagnostics.push({ relPath, diag });
-      }
-    }
-  }
-  if (allDiagnostics.length === 0) {
-    const langs = running.map((s) => s.languageId).join(", ");
-    return {
-      content: [{ type: "text", text: `No diagnostics across ${running.length} running server(s) (${langs}).` }],
-      details: { count: 0 }
-    };
-  }
-  allDiagnostics.sort((a, b) => {
-    const sevDiff = (a.diag.severity ?? 99) - (b.diag.severity ?? 99);
-    if (sevDiff !== 0) return sevDiff;
-    return a.relPath.localeCompare(b.relPath);
-  });
-  const errors = allDiagnostics.filter((d) => d.diag.severity === DiagnosticSeverity.Error).length;
-  const warnings = allDiagnostics.filter((d) => d.diag.severity === DiagnosticSeverity.Warning).length;
-  const other = allDiagnostics.length - errors - warnings;
-  const fileCount = new Set(allDiagnostics.map((d) => d.relPath)).size;
-  const summary = [
-    `${allDiagnostics.length} diagnostic(s) in ${fileCount} file(s)`,
-    errors > 0 ? `${errors} error(s)` : null,
-    warnings > 0 ? `${warnings} warning(s)` : null,
-    other > 0 ? `${other} other` : null
-  ].filter(Boolean).join(", ");
-  const lines = allDiagnostics.map((d) => formatDiagnostic(d.diag, d.relPath));
-  const output = lines.join("\n");
-  const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-  let resultText = `${summary}
-
-${truncation.content}`;
-  if (truncation.truncated) {
-    resultText += `
-
-[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
-  }
-  return {
-    content: [{ type: "text", text: resultText }],
-    details: { count: allDiagnostics.length, errors, warnings, files: fileCount }
   };
 }
 
@@ -2450,6 +2396,7 @@ No hover information available at this position. [tree-sitter]` : "No hover info
 
 // src/tools/definition.ts
 import { Type as Type3 } from "typebox";
+import { truncateHead as truncateHead2, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES2, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES2 } from "@earendil-works/pi-coding-agent";
 import { Text as Text3 } from "@earendil-works/pi-tui";
 
 // src/shared/format.ts
@@ -2475,19 +2422,21 @@ function formatLocationLink(link, rootDir) {
 }
 
 // src/tools/definition.ts
-import { readFile as readFile6 } from "node:fs/promises";
-import { relative as relative3 } from "node:path";
+import { readFile as readFile6, mkdtemp, writeFile } from "node:fs/promises";
+import { relative as relative3, join as join2 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
 var DefinitionParams = Type3.Object({
   path: Type3.String({ description: "File path" }),
   line: Type3.Optional(Type3.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
   character: Type3.Optional(Type3.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
-  query: Type3.Optional(Type3.String({ description: "Symbol name to find in the file. Alternative to line/character \u2014 resolves the symbol's position automatically." }))
+  query: Type3.Optional(Type3.String({ description: "Symbol name to find in the file. Alternative to line/character \u2014 resolves the symbol's position automatically." })),
+  includeMetadata: Type3.Optional(Type3.Boolean({ description: "For csharp: definition URIs, fetch decompiled source through the same server's csharp/metadata endpoint. Default false. Requires csharp-ls metadata-uris." }))
 });
 function createDefinitionTool(manager, treeSitter, workspaceIndex) {
   return {
     name: "lsp_definition",
     label: "LSP Definition",
-    description: "Go to the definition of a symbol at a specific position. Returns the file path and location of the definition. Line and character are 1-indexed.",
+    description: "Go to the definition of a symbol. Returns source locations; includeMetadata=true also reads csharp: metadata definitions through csharp-ls (native read cannot read those URIs). Line and character are 1-indexed.",
     promptSnippet: "Jump to the definition of a symbol at a file position via LSP",
     parameters: DefinitionParams,
     async execute(_toolCallId, params) {
@@ -2548,9 +2497,32 @@ ${locations.map((l) => `  ${l}`).join("\n")}`;
           if (resolvedFrom) text = `${resolvedFrom}
 
 ${text}`;
-          return { content: [{ type: "text", text }], details: { count: locations.length } };
+          let metadataCount = 0;
+          if (params.includeMetadata) {
+            const definitions = Array.isArray(result) ? result : [result];
+            const uris = new Set(definitions.map((location) => "targetUri" in location ? location.targetUri : location.uri));
+            for (const metadataUri of uris) {
+              if (!metadataUri.startsWith("csharp:")) continue;
+              const metadata = await client.sendRequest("csharp/metadata", { textDocument: { uri: metadataUri } });
+              if (!metadata || typeof metadata.source !== "string") throw new Error(`Invalid metadata source for ${metadataUri}`);
+              text += `
+
+Metadata source (${metadataUri}):
+${metadata.source}`;
+              metadataCount++;
+            }
+          }
+          const truncated = truncateHead2(text, { maxLines: DEFAULT_MAX_LINES2, maxBytes: DEFAULT_MAX_BYTES2 });
+          let fullOutputPath;
+          if (truncated.truncated) {
+            fullOutputPath = join2(await mkdtemp(join2(tmpdir2(), "pi-lsp-definition-")), "definition.txt");
+            await writeFile(fullOutputPath, text, "utf8");
+          }
+          return { content: [{ type: "text", text: truncated.content + (fullOutputPath ? `
+
+[Output truncated. Full definition/metadata: ${fullOutputPath}]` : "") }], details: { count: locations.length, metadataCount, fullOutputPath } };
         } catch (err) {
-          return { content: [{ type: "text", text: `LSP definition request failed: ${err.message}` }], details: { count: 0 } };
+          return { isError: true, content: [{ type: "text", text: `LSP definition request failed: ${err.message}` }], details: { count: 0 } };
         }
       }
       if (treeSitter) {
@@ -2628,7 +2600,7 @@ ${msg}` : msg;
 
 // src/tools/references.ts
 import { Type as Type4 } from "typebox";
-import { truncateHead as truncateHead2, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES2, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES2 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead3, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES3, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES3 } from "@earendil-works/pi-coding-agent";
 import { Text as Text4 } from "@earendil-works/pi-tui";
 var ReferencesParams = Type4.Object({
   path: Type4.String({ description: "File path" }),
@@ -2688,7 +2660,7 @@ No references found.` : "No references found.";
         const rootDir = manager.resolvePath(".");
         const formatted = locations.map((l) => formatLocation(l, rootDir));
         const output = formatted.join("\n");
-        const truncation = truncateHead2(output, { maxLines: DEFAULT_MAX_LINES2, maxBytes: DEFAULT_MAX_BYTES2 });
+        const truncation = truncateHead3(output, { maxLines: DEFAULT_MAX_LINES3, maxBytes: DEFAULT_MAX_BYTES3 });
         let resultText = `${locations.length} reference(s) found:
 
 ${truncation.content}`;
@@ -2727,7 +2699,7 @@ ${resultText}`;
 // src/tools/symbols.ts
 import { Type as Type5 } from "typebox";
 import { SymbolKind as SymbolKind2 } from "vscode-languageserver-protocol";
-import { truncateHead as truncateHead3, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES3, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES3 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead4, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES4, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES4 } from "@earendil-works/pi-coding-agent";
 import { Text as Text5 } from "@earendil-works/pi-tui";
 import { readFile as readFile7 } from "node:fs/promises";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
@@ -2836,7 +2808,7 @@ function createSymbolsTool(manager, treeSitter, workspaceIndex) {
               lines = result.map((s) => formatSymbolInfo(s, rootDir));
             }
             const output = lines.join("\n");
-            const truncation = truncateHead3(output, { maxLines: DEFAULT_MAX_LINES3, maxBytes: DEFAULT_MAX_BYTES3 });
+            const truncation = truncateHead4(output, { maxLines: DEFAULT_MAX_LINES4, maxBytes: DEFAULT_MAX_BYTES4 });
             let text = `${lines.length} symbol(s):
 
 ${truncation.content}`;
@@ -2862,7 +2834,7 @@ ${truncation.content}`;
                 }
                 const lines = symbols.flatMap((s) => formatTreeSitterSymbol(s));
                 const output = lines.join("\n");
-                const truncation = truncateHead3(output, { maxLines: DEFAULT_MAX_LINES3, maxBytes: DEFAULT_MAX_BYTES3 });
+                const truncation = truncateHead4(output, { maxLines: DEFAULT_MAX_LINES4, maxBytes: DEFAULT_MAX_BYTES4 });
                 let text = `${lines.length} symbol(s) [tree-sitter]:
 
 ${truncation.content}`;
@@ -2893,7 +2865,7 @@ ${truncation.content}`;
             const rootDir = manager.resolvePath(".");
             const lines = result.map((s) => formatSymbolInfo(s, rootDir));
             const output = lines.join("\n");
-            const truncation = truncateHead3(output, { maxLines: DEFAULT_MAX_LINES3, maxBytes: DEFAULT_MAX_BYTES3 });
+            const truncation = truncateHead4(output, { maxLines: DEFAULT_MAX_LINES4, maxBytes: DEFAULT_MAX_BYTES4 });
             let text = `${result.length} symbol(s) found:
 
 ${truncation.content}`;
@@ -2919,7 +2891,7 @@ ${truncation.content}`;
             return `${kindName(e.kind)} ${e.name} ${relPath}:${e.line}`;
           });
           const output = lines.join("\n");
-          const truncation = truncateHead3(output, { maxLines: DEFAULT_MAX_LINES3, maxBytes: DEFAULT_MAX_BYTES3 });
+          const truncation = truncateHead4(output, { maxLines: DEFAULT_MAX_LINES4, maxBytes: DEFAULT_MAX_BYTES4 });
           let text = `${results.length} symbol(s) found [tree-sitter]:
 
 ${truncation.content}`;
@@ -2952,52 +2924,44 @@ ${truncation.content}`;
 
 // src/tools/rename.ts
 import { Type as Type6 } from "typebox";
-import { truncateHead as truncateHead4, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES4, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES4 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead5, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES5, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES5 } from "@earendil-works/pi-coding-agent";
 import { Text as Text6 } from "@earendil-works/pi-tui";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
-import { relative as relative5 } from "node:path";
+import { relative as relative5, join as join3 } from "node:path";
+import { mkdtemp as mkdtemp2, writeFile as writeFile2 } from "node:fs/promises";
+import { tmpdir as tmpdir3 } from "node:os";
 function formatWorkspaceEdit(edit, rootDir) {
   const lines = [];
-  let totalEdits = 0;
-  let fileCount = 0;
+  const files = /* @__PURE__ */ new Set();
+  let editCount = 0;
+  let resourceOperations = 0;
+  const appendEdits = (uri, edits, version) => {
+    files.add(uri);
+    let file;
+    try {
+      file = relative5(rootDir, fileURLToPath5(uri));
+    } catch {
+      file = uri;
+    }
+    lines.push(`${file}${version !== void 0 ? ` (document version: ${version ?? "unspecified"})` : ""}:`);
+    for (const textEdit of edits) {
+      const { start, end } = textEdit.range;
+      lines.push(`  ${start.line + 1}:${start.character + 1}-${end.line + 1}:${end.character + 1} \u2192 ${JSON.stringify(textEdit.newText)}`);
+      editCount++;
+    }
+  };
   if (edit.documentChanges) {
     for (const change of edit.documentChanges) {
-      if ("textDocument" in change && "edits" in change) {
-        fileCount++;
-        let relPath;
-        try {
-          relPath = relative5(rootDir, fileURLToPath5(change.textDocument.uri));
-        } catch {
-          relPath = change.textDocument.uri;
-        }
-        lines.push(`${relPath}:`);
-        for (const textEdit of change.edits) {
-          const line = textEdit.range.start.line + 1;
-          const col = textEdit.range.start.character + 1;
-          lines.push(`  ${line}:${col} \u2192 "${textEdit.newText}"`);
-          totalEdits++;
-        }
+      if ("textDocument" in change) {
+        appendEdits(change.textDocument.uri, change.edits, change.textDocument.version);
+      } else {
+        resourceOperations++;
+        lines.push(`Resource operation: ${JSON.stringify(change)}`);
       }
     }
   }
-  const changes = edit.changes ?? {};
-  for (const [uri, edits] of Object.entries(changes)) {
-    fileCount++;
-    let relPath;
-    try {
-      relPath = relative5(rootDir, fileURLToPath5(uri));
-    } catch {
-      relPath = uri;
-    }
-    lines.push(`${relPath}:`);
-    for (const textEdit of edits) {
-      const line = textEdit.range.start.line + 1;
-      const col = textEdit.range.start.character + 1;
-      lines.push(`  ${line}:${col} \u2192 "${textEdit.newText}"`);
-      totalEdits++;
-    }
-  }
-  return { summary: lines.join("\n"), fileCount, editCount: totalEdits };
+  for (const [uri, edits] of Object.entries(edit.changes ?? {})) appendEdits(uri, edits);
+  return { summary: lines.join("\n"), fileCount: files.size, editCount, resourceOperations };
 }
 var RenameParams = Type6.Object({
   path: Type6.String({ description: "File path" }),
@@ -3053,29 +3017,35 @@ Rename not possible at this position.` : "Rename not possible at this position."
           return { content: [{ type: "text", text: text2 }], details: { fileCount: 0, editCount: 0 } };
         }
         const rootDir = manager.resolvePath(".");
-        const { summary, fileCount, editCount } = formatWorkspaceEdit(result, rootDir);
-        if (editCount === 0) {
+        const { summary, fileCount, editCount, resourceOperations } = formatWorkspaceEdit(result, rootDir);
+        if (editCount === 0 && resourceOperations === 0) {
           const text2 = resolvedFrom ? `${resolvedFrom}
 
 No edits needed for this rename.` : "No edits needed for this rename.";
           return { content: [{ type: "text", text: text2 }], details: { fileCount: 0, editCount: 0 } };
         }
-        const truncation = truncateHead4(summary, { maxLines: DEFAULT_MAX_LINES4, maxBytes: DEFAULT_MAX_BYTES4 });
+        const truncation = truncateHead5(summary, { maxLines: DEFAULT_MAX_LINES5, maxBytes: DEFAULT_MAX_BYTES5 });
         let text = "";
         if (resolvedFrom) text += `${resolvedFrom}
 
 `;
-        text += `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s)
+        text += `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s), ${resourceOperations} resource operation(s)
 
 `;
-        text += "NOTE: These changes are NOT applied. Use edit/write tools to make the changes.\n\n";
+        text += "NOTE: Preview only. Ranges are 1-based UTF-16, with an exclusive end. Recompute if documents change; this is not a version-checked apply operation.\n\n";
         text += truncation.content;
-        if (truncation.truncated) text += `
+        let fullOutputPath;
+        if (truncation.truncated) {
+          const dir = await mkdtemp2(join3(tmpdir3(), "pi-lsp-rename-"));
+          fullOutputPath = join3(dir, "workspace-edit.json");
+          await writeFile2(fullOutputPath, JSON.stringify(result, null, 2), "utf8");
+          text += `
 
-[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines]`;
-        return { content: [{ type: "text", text }], details: { fileCount, editCount } };
+[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines. Full raw WorkspaceEdit (0-based LSP ranges): ${fullOutputPath}]`;
+        }
+        return { content: [{ type: "text", text }], details: { fileCount, editCount, resourceOperations, workspaceEdit: result, fullOutputPath } };
       } catch (err) {
-        return { content: [{ type: "text", text: `LSP rename request failed: ${err.message}` }], details: { fileCount: 0, editCount: 0 } };
+        return { isError: true, content: [{ type: "text", text: `LSP rename request failed: ${err.message}` }], details: { fileCount: 0, editCount: 0 } };
       }
     },
     renderCall(args, theme) {
@@ -3092,15 +3062,15 @@ No edits needed for this rename.` : "No edits needed for this rename.";
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text6(theme.fg("warning", "Computing..."), 0, 0);
       const details = result.details;
-      if (!details || details.editCount === 0) return new Text6(theme.fg("dim", "No edits"), 0, 0);
-      return new Text6(theme.fg("success", `${details.editCount} edit(s) in ${details.fileCount} file(s) (preview only)`), 0, 0);
+      if (!details || details.editCount === 0 && !details.resourceOperations) return new Text6(theme.fg("dim", "No edits"), 0, 0);
+      return new Text6(theme.fg("success", `${details.editCount} edit(s) in ${details.fileCount} file(s), ${details.resourceOperations ?? 0} resource operation(s) (preview only)`), 0, 0);
     }
   };
 }
 
 // src/tools/code-overview.ts
 import { Type as Type7 } from "typebox";
-import { truncateHead as truncateHead5, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES5, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES5 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead6, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES6, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES6 } from "@earendil-works/pi-coding-agent";
 import { Text as Text7 } from "@earendil-works/pi-tui";
 import { resolve as resolve4, relative as relative6 } from "node:path";
 import { readdir as readdir2, readFile as readFile8 } from "node:fs/promises";
@@ -3220,7 +3190,7 @@ ${symbolLines.join("\n")}`);
 - ${stats.symbols} symbols`);
       }
       const output = sections.join("\n\n");
-      const truncation = truncateHead5(output, { maxLines: DEFAULT_MAX_LINES5, maxBytes: DEFAULT_MAX_BYTES5 });
+      const truncation = truncateHead6(output, { maxLines: DEFAULT_MAX_LINES6, maxBytes: DEFAULT_MAX_BYTES6 });
       let text = truncation.content;
       if (truncation.truncated) {
         text += `
@@ -3600,7 +3570,7 @@ ${header}`;
 
 // src/tools/code-search.ts
 import { Type as Type9 } from "typebox";
-import { truncateHead as truncateHead6, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES6, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES6 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead7, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES7, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES7 } from "@earendil-works/pi-coding-agent";
 import { relative as relative7 } from "node:path";
 
 // src/tree-sitter/pattern-compiler.ts
@@ -4050,7 +4020,7 @@ function createCodeSearchTool(rootDirOrGetter, treeSitter) {
       }
       const text = lines.join("\n");
       const uniqueFiles = new Set(matches.map((m) => m.file));
-      const truncation = truncateHead6(text, { maxLines: DEFAULT_MAX_LINES6, maxBytes: DEFAULT_MAX_BYTES6 });
+      const truncation = truncateHead7(text, { maxLines: DEFAULT_MAX_LINES7, maxBytes: DEFAULT_MAX_BYTES7 });
       let output = truncation.content;
       if (truncation.truncated) {
         output += `
@@ -4067,11 +4037,11 @@ function createCodeSearchTool(rootDirOrGetter, treeSitter) {
 
 // src/tools/code-rewrite.ts
 import { Type as Type10 } from "typebox";
-import { truncateHead as truncateHead7, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES7, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES7 } from "@earendil-works/pi-coding-agent";
+import { truncateHead as truncateHead8, DEFAULT_MAX_LINES as DEFAULT_MAX_LINES8, DEFAULT_MAX_BYTES as DEFAULT_MAX_BYTES8 } from "@earendil-works/pi-coding-agent";
 import { relative as relative8 } from "node:path";
 
 // src/tree-sitter/rewrite-engine.ts
-import { readFile as readFile11, writeFile } from "node:fs/promises";
+import { readFile as readFile11, writeFile as writeFile3 } from "node:fs/promises";
 var METAVAR_REF_RE = /\$\$\$([A-Z_][A-Z0-9_]*)|\$([A-Z_][A-Z0-9_]*)/g;
 function substituteCaptures(template, captures) {
   return template.replace(METAVAR_REF_RE, (match, variadicName, singleName) => {
@@ -4132,7 +4102,7 @@ async function applyRewrites(matches, replacementTemplate) {
       });
     }
     if (modified) {
-      await writeFile(file, content, "utf-8");
+      await writeFile3(file, content, "utf-8");
       filesModified++;
     }
   }
@@ -4210,7 +4180,7 @@ function createCodeRewriteTool(rootDirOrGetter, treeSitter, fileChangeCallback) 
         }
         lines2.push("Run with dry_run=false to apply these changes.");
         const text2 = lines2.join("\n");
-        const truncation2 = truncateHead7(text2, { maxLines: DEFAULT_MAX_LINES7, maxBytes: DEFAULT_MAX_BYTES7 });
+        const truncation2 = truncateHead8(text2, { maxLines: DEFAULT_MAX_LINES8, maxBytes: DEFAULT_MAX_BYTES8 });
         let output2 = truncation2.content;
         if (truncation2.truncated) {
           output2 += `
@@ -4240,7 +4210,7 @@ function createCodeRewriteTool(rootDirOrGetter, treeSitter, fileChangeCallback) 
         lines.push(`${relPath}:${c.line} \u2014 ${beforeShort} \u2192 ${afterShort}`);
       }
       const text = lines.join("\n");
-      const truncation = truncateHead7(text, { maxLines: DEFAULT_MAX_LINES7, maxBytes: DEFAULT_MAX_BYTES7 });
+      const truncation = truncateHead8(text, { maxLines: DEFAULT_MAX_LINES8, maxBytes: DEFAULT_MAX_BYTES8 });
       let output = truncation.content;
       if (truncation.truncated) {
         output += `
@@ -4485,9 +4455,9 @@ ${text}`;
 // src/index.ts
 import { relative as relative10 } from "node:path";
 import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
-import { join as join2 } from "node:path";
+import { join as join4 } from "node:path";
 function loadProjectConfig(dir) {
-  const configPath = join2(dir, ".pi-lsp.json");
+  const configPath = join4(dir, ".pi-lsp.json");
   try {
     if (!existsSync3(configPath)) return null;
     const raw = readFileSync2(configPath, "utf-8");
@@ -4499,14 +4469,6 @@ function loadProjectConfig(dir) {
   }
 }
 function lspExtension(pi) {
-  const origListeners = process.listeners("uncaughtException");
-  process.on("uncaughtException", (err) => {
-    if (err?.code === "EPIPE") return;
-    for (const listener of origListeners) listener(err);
-    if (origListeners.length === 0) {
-      console.error("[LSP] Uncaught exception:", err);
-    }
-  });
   let manager = null;
   let fileSync = null;
   let treeSitter = null;

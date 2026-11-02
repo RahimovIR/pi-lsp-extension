@@ -10,9 +10,9 @@ const HASH = "66a4119f8aefbe8687ef0e14c6e7e0e1844b7950";
 
 test("getJdtlsDataDir mirrors jdtls.py's default -data per platform", () => {
   const cwd = "/work/my-project";
-  assert.equal(getJdtlsDataDir(cwd, "linux", { HOME: "/h" }), `/h/.cache/jdtls/jdtls-${HASH}`);
-  assert.equal(getJdtlsDataDir(cwd, "darwin", { HOME: "/h" }), `/h/Library/Caches/jdtls/jdtls-${HASH}`);
-  assert.equal(getJdtlsDataDir(cwd, "win32", { APPDATA: "/appdata" }), `/appdata/jdtls/jdtls-${HASH}`);
+  assert.equal(getJdtlsDataDir(cwd, "linux", { HOME: "/h" }), join("/h", ".cache", "jdtls", `jdtls-${HASH}`));
+  assert.equal(getJdtlsDataDir(cwd, "darwin", { HOME: "/h" }), join("/h", "Library", "Caches", "jdtls", `jdtls-${HASH}`));
+  assert.equal(getJdtlsDataDir(cwd, "win32", { APPDATA: "/appdata" }), join("/appdata", "jdtls", `jdtls-${HASH}`));
   assert.equal(getJdtlsDataDir(cwd, "freebsd", { HOME: "/h" }), join(tmpdir(), "jdtls", `jdtls-${HASH}`));
 });
 

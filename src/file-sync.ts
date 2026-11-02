@@ -11,6 +11,7 @@
 
 import { readFile } from "node:fs/promises";
 import { LspManager } from "./lsp-manager.js";
+import type { LspClient } from "./lsp-client.js";
 import type { TreeSitterManager } from "./tree-sitter/parser-manager.js";
 import type { WorkspaceIndex } from "./tree-sitter/workspace-index.js";
 
@@ -24,6 +25,8 @@ interface TrackedDocument {
   uri: string;
   languageId: string;
   version: number;
+  client: LspClient;
+  content: string;
 }
 
 export class FileSync {
@@ -69,10 +72,7 @@ export class FileSync {
       this.tracked.delete(evictUri);
 
       // Send didClose to the appropriate LSP server
-      const client = this.manager.getRunningClient(evictDoc.languageId);
-      if (client) {
-        client.didClose(evictUri);
-      }
+      evictDoc.client.didClose(evictUri);
     }
   }
 
@@ -81,31 +81,7 @@ export class FileSync {
    * Called from tool_result handler for the `read` tool.
    */
   async handleFileRead(filePath: string): Promise<void> {
-    const absPath = this.manager.resolvePath(filePath);
-    const uri = this.manager.getFileUri(absPath);
-
-    // Already tracked? Just touch it for LRU freshness.
-    if (this.tracked.has(uri)) {
-      this.touchAndEvict(uri);
-      return;
-    }
-
-    const languageId = this.manager.getLanguageId(absPath);
-    if (!languageId) return;
-
-    // Only sync if we have a client already running for this language (don't start one just for a read)
-    const client = this.manager.getRunningClient(languageId);
-    if (!client) return;
-
-    try {
-      const content = await readFile(absPath, "utf-8");
-      const doc: TrackedDocument = { uri, languageId, version: 1 };
-      this.tracked.set(uri, doc);
-      client.didOpen(uri, languageId, doc.version, content);
-      this.touchAndEvict(uri);
-    } catch {
-      // File might not exist or be unreadable — ignore
-    }
+    await this.syncFile(filePath, false);
   }
 
   /**
@@ -115,7 +91,6 @@ export class FileSync {
   async handleFileWrite(filePath: string): Promise<void> {
     const absPath = this.manager.resolvePath(filePath);
     const uri = this.manager.getFileUri(absPath);
-    const languageId = this.manager.getLanguageId(absPath);
 
     // Invalidate tree-sitter cache and re-index
     if (this.treeSitter) {
@@ -125,8 +100,6 @@ export class FileSync {
         this.workspaceIndex.indexFile(absPath).catch(() => {});
       }
     }
-
-    if (!languageId) return;
 
     // If a synthetic dot operation is in progress for this URI, defer the
     // didChange to avoid version conflicts. The completions tool will revert
@@ -143,27 +116,36 @@ export class FileSync {
       return;
     }
 
-    // Get client (start server lazily if configured)
-    const client = await this.manager.getClientForFile(absPath).catch(() => null);
+    await this.syncFile(filePath, true);
+  }
+
+  private async syncFile(filePath: string, startClient: boolean): Promise<void> {
+    const absPath = this.manager.resolvePath(filePath);
+    const uri = this.manager.getFileUri(absPath);
+    const languageId = this.manager.getLanguageId(absPath);
+    if (!languageId) return;
+    const client = startClient
+      ? await this.manager.getClientForFile(absPath).catch(() => null)
+      : this.manager.getRunningClient(languageId);
     if (!client) return;
-
     try {
-      const content = await readFile(absPath, "utf-8");
+      const content = await readFile(absPath, "utf8");
       const existing = this.tracked.get(uri);
-
-      if (existing) {
-        // Already open — send didChange with incremented version
-        existing.version++;
-        client.didChange(uri, existing.version, content);
+      if (existing?.client === client) {
+        if (existing.content !== content) {
+          existing.version++;
+          existing.content = content;
+          client.didChange(uri, existing.version, content);
+        }
       } else {
-        // First time — send didOpen
-        const doc: TrackedDocument = { uri, languageId, version: 1 };
+        // A restarted server has no open buffers, even if this URI was tracked before.
+        const doc: TrackedDocument = { uri, languageId, version: 1, client, content };
         this.tracked.set(uri, doc);
         client.didOpen(uri, languageId, doc.version, content);
       }
       this.touchAndEvict(uri);
     } catch {
-      // File might not exist or be unreadable — ignore
+      // File might no longer exist or be readable.
     }
   }
 
@@ -174,7 +156,7 @@ export class FileSync {
    */
   getTrackedVersion(uri: string): number | null {
     const doc = this.tracked.get(uri);
-    return doc ? doc.version : null;
+    return doc && this.manager.getRunningClient(doc.languageId) === doc.client ? doc.version : null;
   }
 
   /**

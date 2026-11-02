@@ -113,6 +113,11 @@ export class LspManager {
   private _sessionId: string;
   private _lombokJarPath: string | null = null;
   private _shuttingDown = false;
+  private _disposed = false;
+  private _workspaceKey: string;
+  private _workspaceSwitch: Promise<void> = Promise.resolve();
+  private _startingClients = new Set<LspClient>();
+  private _restartTimers = new Set<ReturnType<typeof setTimeout>>();
   private _restartAttempts: Map<string, number> = new Map();
   private _restartBackoff: Map<string, number> = new Map();
 
@@ -127,6 +132,7 @@ export class LspManager {
       ...customConfigs,
     }));
     this._workspace = workspace ?? new DefaultWorkspaceProvider();
+    this._workspaceKey = this.workspaceKey(this._workspace);
     this._callbacks = callbacks ?? {};
     this._sessionId = sessionId ?? `${process.pid}-${Date.now()}`;
   }
@@ -138,9 +144,27 @@ export class LspManager {
 
   /** Replace the workspace provider (e.g. when an external extension registers one) */
   setWorkspaceProvider(provider: WorkspaceProvider): void {
-    this._workspace = provider;
-    this._workspaceReady = false;
-    this._workspaceReadying = null;
+    const key = this.workspaceKey(provider);
+    if (key === this._workspaceKey) {
+      this._workspace = provider;
+      return;
+    }
+    this._workspaceKey = key;
+    // Do not let requests reuse a client indexed for another worktree.
+    this._shuttingDown = true;
+    this._workspaceSwitch = this._workspaceSwitch.then(async () => {
+      if (this._disposed) return;
+      this._workspace.shutdown();
+      await this.stopClients();
+      this._workspace = provider;
+      this._workspaceReady = false;
+      this._workspaceReadying = null;
+      if (!this._disposed) this._shuttingDown = false;
+    });
+  }
+
+  private workspaceKey(provider: WorkspaceProvider): string {
+    return JSON.stringify([provider.workspaceRoot, provider.stateDir, provider.getWorkspaceFolders()]);
   }
 
   /** Update or add a server configuration */
@@ -356,6 +380,7 @@ export class LspManager {
    * Does not start a new server. Returns null if no client is active.
    */
   getRunningClient(languageId: string): LspClient | null {
+    if (this._disposed || this._shuttingDown) return null;
     const existing = this.clients.get(languageId);
     if (existing && existing.initialized && !existing.disposed) {
       return existing;
@@ -417,6 +442,8 @@ export class LspManager {
    * Returns null if no server is configured for this language.
    */
   async getClientForLanguage(languageId: string): Promise<LspClient | null> {
+    await this._workspaceSwitch;
+    if (this._disposed || this._shuttingDown) return null;
     // Already running?
     const existing = this.clients.get(languageId);
     if (existing && existing.initialized && !existing.disposed) {
@@ -458,19 +485,7 @@ export class LspManager {
    */
   startEagerly(languageIds: string[]): void {
     for (const languageId of languageIds) {
-      // Skip if already running or starting
-      const existing = this.clients.get(languageId);
-      if (existing && existing.initialized && !existing.disposed) continue;
-      if (this.startingServers.has(languageId)) continue;
-
-      const config = this.serverConfigs.get(languageId);
-      if (!config) continue;
-
-      const startPromise = this.startServer(languageId, config);
-      this.startingServers.set(languageId, startPromise);
-
-      startPromise.catch((err) => {
-        this.startingServers.delete(languageId);
+      this.getClientForLanguage(languageId).catch(err => {
         this._callbacks.onServerError?.(languageId, `Auto-start failed: ${err.message}`);
       });
     }
@@ -501,6 +516,7 @@ export class LspManager {
   private async startServer(languageId: string, config: ServerConfig): Promise<LspClient> {
     // Ensure workspace provider is ready (one-time setup)
     await this.ensureWorkspace();
+    if (this._disposed || this._shuttingDown) throw new Error("LSP manager is shutting down");
 
     const stateDir = this._workspace.stateDir;
     const folders = this._workspace.getWorkspaceFolders();
@@ -537,7 +553,7 @@ export class LspManager {
           settings: config.settings,
           onUnexpectedExit,
         });
-        await client.start();
+        await this.startClient(client);
         this.clients.set(languageId, client);
         this.startingServers.delete(languageId);
         this._callbacks.onServerReady?.(languageId);
@@ -586,7 +602,7 @@ export class LspManager {
               settings: config.settings,
               onUnexpectedExit,
             });
-            await client.start();
+            await this.startClient(client);
             this.clients.set(languageId, client);
             this.startingServers.delete(languageId);
             this._callbacks.onServerReady?.(languageId);
@@ -626,7 +642,7 @@ export class LspManager {
     });
 
     try {
-      await client.start();
+      await this.startClient(client);
       this.clients.set(languageId, client);
       this.startingServers.delete(languageId);
       this._callbacks.onServerReady?.(languageId);
@@ -640,6 +656,17 @@ export class LspManager {
       this._callbacks.onServerError?.(languageId, message);
       throw new Error(message);
     }
+  }
+
+  private async startClient(client: LspClient): Promise<void> {
+    this._startingClients.add(client);
+    try {
+      await client.start();
+      if (this._disposed || this._shuttingDown) throw new Error("LSP manager shut down during startup");
+    } catch (error) {
+      await client.shutdown();
+      throw error;
+    } finally { this._startingClients.delete(client); }
   }
 
   /**
@@ -739,7 +766,7 @@ export class LspManager {
       statuses.push({
         languageId,
         command: config.command,
-        running: client?.initialized === true && !client.disposed,
+        running: !this._disposed && !this._shuttingDown && client?.initialized === true && !client.disposed,
         diagnosticsCount,
         shared: daemonAlive,
       });
@@ -771,8 +798,9 @@ export class LspManager {
 
     this._callbacks.onServerCrash?.(languageId, true, attempts + 1);
 
-    setTimeout(() => {
-      if (this._shuttingDown) return;
+    const timer = setTimeout(() => {
+      this._restartTimers.delete(timer);
+      if (this._shuttingDown || this._disposed) return;
       const config = this.serverConfigs.get(languageId);
       if (!config) return;
 
@@ -785,18 +813,30 @@ export class LspManager {
         this.handleUnexpectedExit(languageId, null);
       });
     }, backoff);
+    this._restartTimers.add(timer);
   }
 
   /** Shut down all clients (disconnect from daemons, kill direct servers) */
   async shutdownAll(): Promise<void> {
-    this._workspace.shutdown();
+    this._disposed = true;
     this._shuttingDown = true;
-    const shutdowns = [...this.clients.values()].map((client) =>
-      client.shutdown().catch(() => {})
-    );
-    await Promise.all(shutdowns);
+    await this._workspaceSwitch;
+    this._workspace.shutdown();
+    await this.stopClients();
+  }
+
+  private async stopClients(): Promise<void> {
+    this._shuttingDown = true;
+    for (const timer of this._restartTimers) clearTimeout(timer);
+    this._restartTimers.clear();
+    const pending = [...this.startingServers.values()];
+    const clients = new Set([...this.clients.values(), ...this._startingClients]);
+    await Promise.allSettled([...clients].map(client => client.shutdown()));
+    await Promise.allSettled(pending);
     this.clients.clear();
     this.startingServers.clear();
+    this._restartAttempts.clear();
+    this._restartBackoff.clear();
   }
 
   /**
@@ -805,6 +845,8 @@ export class LspManager {
    * Returns once the new server is initialized, or throws on failure.
    */
   async restartServer(languageId: string): Promise<void> {
+    await this._workspaceSwitch;
+    if (this._disposed) throw new Error("LSP manager is shut down");
     // Shut down existing client
     const existing = this.clients.get(languageId);
     if (existing) {

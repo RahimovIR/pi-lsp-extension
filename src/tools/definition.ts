@@ -5,6 +5,7 @@
 import { Type } from "typebox";
 import type { Location, LocationLink } from "vscode-languageserver-protocol";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { LspManager } from "../lsp-manager.js";
 import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
@@ -13,8 +14,9 @@ import { resolveProvider } from "../resolve-provider.js";
 import { getNodeAtPosition, findDefinition } from "../tree-sitter/symbol-extractor.js";
 import { formatLocation, formatLocationLink } from "../shared/format.js";
 import { resolveSymbolPosition, getSymbolNames } from "../shared/resolve-position.js";
-import { readFile } from "node:fs/promises";
-import { relative } from "node:path";
+import { readFile, mkdtemp, writeFile } from "node:fs/promises";
+import { relative, join } from "node:path";
+import { tmpdir } from "node:os";
 
 type DefinitionResult = Location | Location[] | LocationLink[] | null;
 
@@ -23,9 +25,10 @@ const DefinitionParams = Type.Object({
   line: Type.Optional(Type.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
   character: Type.Optional(Type.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
   query: Type.Optional(Type.String({ description: "Symbol name to find in the file. Alternative to line/character — resolves the symbol's position automatically." })),
+  includeMetadata: Type.Optional(Type.Boolean({ description: "For csharp: definition URIs, fetch decompiled source through the same server's csharp/metadata endpoint. Default false. Requires csharp-ls metadata-uris." })),
 });
 
-interface DefinitionDetails { count: number }
+interface DefinitionDetails { count: number; metadataCount?: number; fullOutputPath?: string }
 
 export function createDefinitionTool(
   manager: LspManager,
@@ -35,7 +38,7 @@ export function createDefinitionTool(
   return {
     name: "lsp_definition",
     label: "LSP Definition",
-    description: "Go to the definition of a symbol at a specific position. Returns the file path and location of the definition. Line and character are 1-indexed.",
+    description: "Go to the definition of a symbol. Returns source locations; includeMetadata=true also reads csharp: metadata definitions through csharp-ls (native read cannot read those URIs). Line and character are 1-indexed.",
     promptSnippet: "Jump to the definition of a symbol at a file position via LSP",
     parameters: DefinitionParams,
 
@@ -102,9 +105,27 @@ export function createDefinitionTool(
             : `Definitions:\n${locations.map((l) => `  ${l}`).join("\n")}`;
           if (resolvedFrom) text = `${resolvedFrom}\n\n${text}`;
 
-          return { content: [{ type: "text", text }], details: { count: locations.length } };
+          let metadataCount = 0;
+          if (params.includeMetadata) {
+            const definitions = Array.isArray(result) ? result : [result];
+            const uris = new Set(definitions.map(location => "targetUri" in location ? location.targetUri : location.uri));
+            for (const metadataUri of uris) {
+              if (!metadataUri.startsWith("csharp:")) continue;
+              const metadata = await client.sendRequest<{ source: string }>("csharp/metadata", { textDocument: { uri: metadataUri } });
+              if (!metadata || typeof metadata.source !== "string") throw new Error(`Invalid metadata source for ${metadataUri}`);
+              text += `\n\nMetadata source (${metadataUri}):\n${metadata.source}`;
+              metadataCount++;
+            }
+          }
+          const truncated = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+          let fullOutputPath: string | undefined;
+          if (truncated.truncated) {
+            fullOutputPath = join(await mkdtemp(join(tmpdir(), "pi-lsp-definition-")), "definition.txt");
+            await writeFile(fullOutputPath, text, "utf8");
+          }
+          return { content: [{ type: "text", text: truncated.content + (fullOutputPath ? `\n\n[Output truncated. Full definition/metadata: ${fullOutputPath}]` : "") }], details: { count: locations.length, metadataCount, fullOutputPath } };
         } catch (err: any) {
-          return { content: [{ type: "text", text: `LSP definition request failed: ${err.message}` }], details: { count: 0 } };
+          return { isError: true, content: [{ type: "text", text: `LSP definition request failed: ${err.message}` }], details: { count: 0 } };
         }
       }
 
